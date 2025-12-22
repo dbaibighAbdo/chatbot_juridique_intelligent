@@ -67,7 +67,7 @@ kg_builder = SimpleKGPipeline(
 # end::kg_builder[]
 
 # tag::run_loader[]
-pdf_file = "data/مدونة الشغل المغربية.pdf"
+pdf_file = "data/code_du_travail.pdf"
 doc = asyncio.run(data_loader.run(pdf_file))
 print(doc.text)
 # end::run_loader[]
