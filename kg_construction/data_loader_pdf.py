@@ -8,6 +8,7 @@ from neo4j import GraphDatabase
 from neo4j_graphrag.llm import OpenAILLM
 from neo4j_graphrag.embeddings import OpenAIEmbeddings
 from neo4j_graphrag.experimental.pipeline.kg_builder import SimpleKGPipeline
+from neo4j_graphrag.experimental.components.text_splitters.fixed_size_splitter import FixedSizeSplitter
 
 # tag::import_loader[]
 from neo4j_graphrag.experimental.components.pdf_loader import PdfLoader, PdfDocument
@@ -36,6 +37,8 @@ embedder = OpenAIEmbeddings(
     model="text-embedding-ada-002"
 )
 
+text_splitter = FixedSizeSplitter(chunk_size=800, chunk_overlap=100)
+
 # tag::loader[]
 class CustomPDFLoader(PdfLoader):
     async def run(
@@ -55,6 +58,49 @@ class CustomPDFLoader(PdfLoader):
 data_loader = CustomPDFLoader()
 # end::loader[]
 
+# definigg the knowledge graph shema
+NODE_TYPES = [
+    "Code",
+    "Article"
+]
+
+RELATIONSHIP_TYPES = [
+    "CONTAINS",           # Code → Article
+    "REFERS_TO",          # Article → Article
+]
+
+
+PATTERNS = [
+    ("Code", "CONTAINS", "Article"),   
+    ("Article", "REFERS_TO", "Article")
+]
+
+
+# end of knowledge graph schema definition
+PROMPT = """ 
+  You are an information extraction system.
+The document is written in French.
+
+Return ONLY a valid JSON object.
+Do not add new lines before the first character.
+Do not wrap the output in markdown.
+Do not explain anything.
+
+The JSON MUST start with { and end with }.
+
+FORMAT (MANDATORY):
+
+{"nodes":[{"label":"Article","properties":{"number":"STRING","text":"STRING"}}],"relationships":[{"source":{"label":"Article","key":"number","value":"STRING"},"type":"GRANTS_RIGHT","target":{"label":"Right","properties":{"name":"STRING"}}}]}
+
+RULES:
+- Use only the allowed labels and relationship types.
+- Keep Arabic text exactly as in the document.
+- Always include both keys: "nodes" and "relationships".
+- If nothing is found, return exactly:
+
+{"nodes":[],"relationships":[]}
+
+ """
 # tag::kg_builder[]
 kg_builder = SimpleKGPipeline(
     llm=llm,
@@ -62,12 +108,13 @@ kg_builder = SimpleKGPipeline(
     neo4j_database=os.getenv("NEO4J_DATABASE"), 
     embedder=embedder, 
     from_pdf=True,
+    text_splitter=text_splitter,
     pdf_loader=data_loader
 )
 # end::kg_builder[]
 
 # tag::run_loader[]
-pdf_file = "data/code_du_travail.pdf"
+pdf_file = "data/code_de_travail_marocain.pdf"
 doc = asyncio.run(data_loader.run(pdf_file))
 print(doc.text)
 # end::run_loader[]
@@ -75,3 +122,23 @@ print(doc.text)
 print(f"Processing {pdf_file}")
 result = asyncio.run(kg_builder.run_async(file_path=pdf_file))
 print(result.result)
+
+
+
+
+
+
+
+
+
+
+'''
+data_path = "./genai-graphrag-python/data/"
+pdf_files = [os.path.join(data_path, f) for f in os.listdir(data_path) if f.endswith('.pdf')]
+
+for pdf_file in pdf_files:
+
+    print(f"Processing {pdf_file}")
+    result = asyncio.run(kg_builder.run_async(file_path=pdf_file))
+    print(result.result)
+'''
