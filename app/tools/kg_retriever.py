@@ -12,7 +12,7 @@ Use only the provided relationship types and properties in the schema.
 Do not use any other relationship types or properties that are not provided.
 
 Do not return entire nodes or embedding properties.
-Do not return any thing if the answer is not found in the graph.
+Do not return ANYTHING "" if the answer is not found in the graph.
 
 Schema:
 {schema}

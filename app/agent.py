@@ -1,152 +1,172 @@
-from helpers.llm import llm
-from helpers.graph import graph
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.prompts import PromptTemplate
-from langchain.schema import StrOutputParser
-from langchain.tools import Tool
-from langchain_neo4j import Neo4jChatMessageHistory
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain import hub
-from helpers.utils import get_session_id
+import os
 from tools.kg_retriever import cypher_qa
 from tools.vector_retriever import get_related_context
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import InMemorySaver
+from pydantic import BaseModel, Field
 
 
+from langgraph.graph import END, MessagesState, START, StateGraph
 
-tools = [
-    Tool.from_function(
-        name="Moroccan labor law informations",
-        description="Provide information about Moroccan labor law questions using Cypher",
-        func = cypher_qa
-    ),
-    Tool.from_function(
-        name="Related context",
-        description="Provide related context about Moroccan labor law questions",
-        func = get_related_context
-    )
-]
+class SearchQuery(BaseModel):
+    search_query: str = Field(..., description="Search query for retrieval.")
 
-def get_memory(session_id):
-    return Neo4jChatMessageHistory(session_id=session_id, graph=graph)
+class GraphAgentState(MessagesState):
+    vector_db_context: str
+    cypher_db_context: str
+    web_context: str
 
-agent_prompt = PromptTemplate.from_template("""
-You are a Moroccan labor law expert whose sole task is to provide accurate information
-exclusively about Moroccan labor laws (Code du Travail marocain et related legal texts).
-You must ALWAYS respond in French.
+llm = ChatOpenAI(model="gpt-5", temperature=1.0, api_key=os.getenv("OPENAI_API_KEY"))
 
-========================
-STRICT OPERATION RULES
-========================
+answer_generator_prompt = """You are a highly qualified Moroccan law expert.
 
-1. DUAL-TOOL OBLIGATION (CRITICAL RULE)
-- For any user query that is NOT a greeting, you MUST use BOTH tools:
-  1) "Moroccan labor law informations" (Cypher / Knowledge Graph)
-  2) "Related context" (Vector / contextual retriever)
-- Using only ONE tool is STRICTLY FORBIDDEN.
-- Your final answer MUST be a combination of:
-  - Legal facts returned by the Cypher tool
-  - Contextual explanations returned by the Related Context tool
+Your sole mission is to provide precise, reliable, and legally accurate information based strictly on the provided data.
 
-2. TOOL AUTHORITY RULE
-- Your final answer MUST be based STRICTLY AND EXCLUSIVELY on tool outputs.
-- You are strictly forbidden from:
-  - Using your pre-trained knowledge
-  - Adding assumptions, interpretations, or external legal information
-  - Filling gaps if tools do not provide information
+LANGUAGE RULE (STRICT):
+- You MUST ALWAYS respond in Arabic (الفصحى).
+- Do NOT use French or any other language in your final answer.
 
-3. GREETING EXCEPTION (ONLY EXCEPTION)
-- If the user input is ONLY a greeting (e.g., "Bonjour", "Salam", "Hello"):
-  - You may respond WITHOUT using any tool
-  - The response must be short, polite, and neutral
-  - You MUST NOT provide any legal information
+CONTENT RULES (STRICT):
+- Base your answer ONLY on the extracted legal information and context provided below.
+- Do NOT add assumptions, interpretations, or external knowledge.
+- Do NOT generate any content that is not directly supported by the provided information.
 
-4. SCOPE RESTRICTION
-- You MUST NOT answer questions that:
-  - Are unrelated to Moroccan labor law
-  - Concern foreign labor laws
-  - Ask for opinions or legal advice not grounded in Moroccan legislation
-- In such cases, politely refuse and state that the question is outside your scope.
+STRUCTURE & STYLE REQUIREMENTS:
+- The answer must be clear, well-structured, and easy to read.
+- Use rich paragraphs and, when appropriate, bullet points.
+- Use the maximum detail possible from the provided information related to the question.
+- Use formal and professional legal Arabic.
+- Ensure logical flow and coherence.
+- Avoid redundancy and unnecessary explanations.
 
-5. COMPLETENESS & FUSION RULE
-- You must:
-  - Extract legal rules, articles, or entities from the Cypher tool
-  - Enrich them ONLY with explanations found in the Related Context tool
-- Do NOT repeat tool outputs verbatim.
-- Do NOT add anything not explicitly present in at least one tool.
-
-6. EMPTY OR PARTIAL RESULT RULE
-- If ONE of the tools returns no information:
-  - Explicitly state that part of the information could not be found
-  - Still answer using the other tool
-- If BOTH tools return no information:
-  - Clearly state that no relevant legal information was found
-  - Do NOT infer or guess
+INSUFFICIENT INFORMATION RULE:
+- If the provided information is insufficient to answer the question, respond EXACTLY with:
+  "Je n’ai pas assez d’informations pour répondre à cette question.(in Arabic)"
 
 ========================
-TOOLS USAGE (MANDATORY SEQUENCE)
+ Extracted Legal Information (Neo4j / Cypher):
+{cypher_db_context}
 ========================
-
-For any non-greeting question, you MUST follow this reasoning sequence:
-
-Thought: Do I need to use a tool? Yes
-Action: Moroccan labor law informations
-Action Input: reformulate the legal question clearly
-Observation: legal facts / articles from the knowledge graph
-
-Thought: Do I need to use another tool? Yes
-Action: Related context
-Action Input: same question to retrieve explanations and context
-Observation: contextual or explanatory information
-
-ONLY after BOTH tools are used, you may answer the user.
-
+ Extracted Context (Vector Database):
+{vector_db_context}
 ========================
-FINAL RESPONSE FORMAT
+ Extracted Web Search Results (if any):
+{web_context}
 ========================
-
-Thought: Do I need to use a tool? No
-Final Answer:
-- Clear legal answer in French
-- Based ONLY on BOTH tool outputs
-- Structured, precise, and neutral
-
+ User Question:
+{user_input}
 ========================
-CONTEXT
-========================
+✍️ Final Answer (Arabic only):
+"""
 
-Previous conversation history:
-{chat_history}
+def cypher_retriever(state: GraphAgentState):
+    try:
+        graph_result = cypher_qa.invoke({"query": state["messages"][-1].content})
+        graph_answer = graph_result.get("result", "").strip()
+        if not graph_answer:
+            graph_answer = ""
+    except Exception:
+        graph_answer = ""
 
-New user input:
-{input}
-
-{agent_scratchpad}
-""")
+    return {"cypher_db_context": graph_answer}
 
 
-agent = create_react_agent(llm, tools, agent_prompt)
-agent_executor = AgentExecutor(
-    agent=agent,
-    tools=tools,
-    verbose=True
+def vector_retriever(state: GraphAgentState):
+    try:
+        context = get_related_context(str(state["messages"][-1].content))
+        if not context:
+            context = ""
+    except Exception:
+        context = ""
+
+    return {"vector_db_context": context}
+
+
+
+search_instructions = SystemMessage(content=f"""You will be given a conversation between an user and an assistant. 
+
+Your goal is to generate a well-structured ARABIC query for use in retrieval and / or web-search related to the conversation.
+First, analyze the full conversation.
+Convert this final question into a well-structured web search query""")
+
+llm_for_search = ChatOpenAI(model="gpt-4o-mini", temperature=1.0, api_key=os.getenv("OPENAI_API_KEY"))
+
+
+def search_web(state: GraphAgentState): 
+    """ Retrieve docs from web search """ 
+    tavily_search = TavilySearchResults(max_results=3) 
+    # Search query 
+    structured_llm = llm_for_search.with_structured_output(SearchQuery) 
+    search_query = structured_llm.invoke([search_instructions]+state['messages']) 
+    # Search 
+    search_docs = tavily_search.invoke(search_query.search_query) 
+    # Format 
+    formatted_search_docs = "\n\n---\n\n".join( [ f'<Document href="{doc["url"]}"/>\n{doc["content"]}\n</Document>' for doc in search_docs ] ) 
+    return {"web_context": [formatted_search_docs]}
+
+
+
+def get_final_answer(state: GraphAgentState):
+    prompt = answer_generator_prompt.format(
+        cypher_db_context=state["cypher_db_context"],
+        vector_db_context=state["vector_db_context"],
+        web_context=state["web_context"],
+        user_input=state["messages"][-1].content
     )
 
-chat_agent = RunnableWithMessageHistory(
-    agent_executor,
-    get_memory,
-    input_messages_key="input",
-    history_messages_key="chat_history",
-)
+    response = llm.invoke([
+        SystemMessage(content=prompt)
+    ])
 
-def generate_response(user_input):
-    """
-    Create a handler that calls the Conversational agent
-    and returns a response to be rendered in the UI
-    """
+    return {"messages": [response]}
 
-    response = chat_agent.invoke(
-        {"input": user_input},
-        {"configurable": {"session_id": get_session_id()}},)
 
-    return response['output']
+
+
+graph = StateGraph(GraphAgentState)
+
+graph.add_node("Cypher Retrieval", cypher_retriever)
+graph.add_node("Vector Retrieval", vector_retriever)
+graph.add_node("Web Search Retrieval", search_web)
+graph.add_node("Final Answer Generation", get_final_answer)
+
+graph.add_edge(START, "Cypher Retrieval")
+graph.add_edge(START, "Vector Retrieval")
+graph.add_edge(START, "Web Search Retrieval")
+graph.add_edge("Cypher Retrieval", "Final Answer Generation")
+graph.add_edge("Vector Retrieval", "Final Answer Generation")
+graph.add_edge("Web Search Retrieval", "Final Answer Generation")
+graph.add_edge("Final Answer Generation", END)
+
+memory = InMemorySaver()
+workflow = graph.compile(checkpointer=memory)
+
+import uuid  # Add this import
+
+def generate_response(user_input: str, config):
+    # Append new user message
+    messages = [HumanMessage(content=user_input)]
+    
+    input_state = {
+        "messages": messages,
+        "vector_db_context": "",
+        "cypher_db_context": "",
+        "web_context": ""
+    }
+    
+    # Stream the graph
+    for event in workflow.stream(input_state, config):
+        pass  # State accumulates in checkpointer
+    
+    # Get final state and return last assistant message
+    final_state = workflow.get_state(config)
+    final_messages = final_state.values.get("messages", [])
+    
+    # Find last non-retriever message (assistant response)
+    for msg in reversed(final_messages):
+        if hasattr(msg, 'content') and msg.content:  # HumanMessage/AIMessage
+            return msg.content
+    
+    return "No response generated"
