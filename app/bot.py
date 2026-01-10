@@ -24,7 +24,7 @@ if "thread_id" not in st.session_state:
 def handle_submit(message):
     config = {"configurable": {"thread_id": st.session_state.thread_id}}
     
-    with st.spinner('Réfléchissant...'):
+    with st.spinner('جاري التفكير...'):
         response = generate_response(message, config)
         # Optionally save to session_state.messages for display
         st.session_state.messages.append({"role": "assistant", "content": response})
